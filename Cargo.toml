@@ -6,12 +6,17 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+# ディレクトリ操作
 dirs = "5.0.1"
+# 行読み込み
 rustyline = "11.0.0"
+# Unix APIラッパ
 nix = "0.26.2"
+# シグナル
 signal-hook = "0.3.15"
 
 [profile.release]
+# パニックの際にプログラムを終了する
 panic = "abort"
 
 [profile.dev]
