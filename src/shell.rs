@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::exit;
 use std::sync::mpsc::{channel, Sender, sync_channel};
 use std::thread;
-use nix::libc;
 
-use nix::libc::{SIGINT, SIGTSTP, SIGCHLD, tcgetpgrp};
+use nix::libc;
+use nix::libc::{SIGCHLD, SIGINT, SIGTSTP, tcgetpgrp};
 use nix::sys::signal::{SigHandler, Signal, signal};
 use nix::unistd::Pid;
-use rustyline::{DefaultEditor};
+use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use signal_hook::iterator::Signals;
 
@@ -77,7 +77,7 @@ impl Shell {
         // 起動
         spawn_sig_handler(worker_tx.clone())?;
         // 起動
-        Worker::new().spawn(worker_rx, shell_tx);
+        // Worker::new().spawn(worker_rx, shell_tx);
 
         // 終了コード
         let exit_val;
@@ -183,13 +183,90 @@ struct Worker {
 
 impl Worker {
     fn new() -> Self {
+
         Worker {
             exit_val: 0,
             fg: None, // フォアグラウンドはシェル
             jobs: BTreeMap::new(),
             pgid_to_pid: HashMap::new(),
             pid_to_info: HashMap::new(),
-            shell_pgid: tcgetpgrp(libc::STDIN_FILENO).unwrap(),
+            // シェルのプロセスグループIDを取得
+            // ファイルディスクリプタに関連付けられたフォアグラウンドのプロセスグループIDを取得する
+            // libc::STDIN_FILENO は標準入力
+            // ちなみに、getpgid システムコールも使用できるがフォアグラウンドかどうかも検査するためにこちらを使う
+            shell_pgid: Pid(unsafe {tcgetpgrp(libc::STDIN_FILENO)}),
         }
+    }
+
+
+    // worker_rx: worker の receiver
+    // shell_tx: shell の SyncSender
+    // fn spawn(mut self, worker_rx: Receiver<WorkerMsg>, shell_tx: SyncSender<ShellMsg>) {
+    //     thread::spawn(move || {
+    //        for msg in worker_rx.iter() { // worker_rx から受信
+    //            match msg {
+    //                WorkerMsg::Cmd(line) => {
+    //                    match parse_cmd(&line) { // メッセージパース
+    //                        Ok(cmd) => {
+    //                            // ★組み込みコマンド 実行
+    //                            if self.built_in_cmd(&cmd, &shell_tx) {
+    //                                // 完了したら、worker_rx から受信を再開
+    //                                continue;
+    //                            }
+    //
+    //                            // ★組み込みコマンド以外は子プロセス生成して、外部プログラム実行
+    //                            if !self.spawn_child(&line, &cmd) {
+    //                                // 子プロセス生成に失敗した場合
+    //                                // シェルからの入力を再開、mainスレッドに通知
+    //                                shell_tx.send(
+    //                                    ShellMsg::Continue(self.exit_val)
+    //                                ).unwrap();
+    //                            }
+    //                        }
+    //                        Err(e) => {
+    //                            eprintln!("ZeroSh: {e}");
+    //                            shell_tx.send(
+    //                                ShellMsg::Continue(self.exit_val)
+    //                            ).unwrap();
+    //                        }
+    //                    }
+    //                }
+    //                WorkerMsg::Signal(SIGCHLD) => {
+    //                    self.wait_child(&shell_tx); // ★子プロセスの状態変化管理
+    //                }
+    //                _ => (), // 無視
+    //            }
+    //        }
+    //     });
+    // }
+}
+
+type CmdResult<'a> = Result<Vec<(&'a str, Vec<&'a str>)>, DynError>;
+
+// "echo hello | less" -> vec![("echo", vec!["hello"]), ("less", vec![])]
+// ベクタの要素は パイプ で区切られた処理
+// 第0要素がコマンド、第1要素が引数
+fn parse_cmd(line: &str) -> CmdResult {
+    // '|' で split
+    // 各要素を ' ' で split
+    //   ただし、空白文字列は無視するか、パイプの先にコマンドが指定されていない場合はエラー
+    let commands = line.split('|').collect();
+    commands.iter().map(|execution| {
+        let mut elements = execution.split_whitespace();
+        let cmd = elements.next().or(Err("コマンドがありません"))?;
+        let args = cmd.collect();
+        Ok((cmd, args))
+    }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::shell::parse_cmd;
+
+    #[test]
+    fn test_parse_cmd() {
+        let line = "echo hello | less";
+        let expected = vec![("echo", vec!["hello"]), ("less", vec![])];
+        assert_eq!(parse_cmd(line), expected);
     }
 }
