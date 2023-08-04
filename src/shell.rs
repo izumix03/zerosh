@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
+use std::mem::replace;
 use std::process::exit;
 use std::sync::mpsc::{channel, Receiver, Sender, sync_channel, SyncSender};
 use std::thread;
@@ -534,7 +535,39 @@ impl Worker {
 
     // プロセスの状態を設定し、以前の状態を返す
     // pid が存在しない場合は None を返す
+    fn set_pid_state(&mut self, pid: Pid, state: ProcState) -> Option<ProcState> {
+        let info = self.pid_to_info.get_mut(&pid)?;
+        Some(replace(&mut info.state, state))
+    }
 
+    // プロセス情報を削除して、削除できた場合はプロセスの所属する(ジョブID,プロセスグループID)を返す
+    // 存在しない場合はNoneを返す
+    fn remove_pid(&mut self, pid: Pid) -> Option<(usize, Pid)> {
+        // プロセスグループID取得
+        let pgid = self.pid_to_info.get(&pid)?.pgid;
+        let it = self.pgid_to_pids.get_mut(&pgid)?;
+        // プロセスグループからpid削除
+        it.1.remove(&pid);
+        // ジョブIDを取得
+        let job_id = it.0;
+        Some((job_id, pgid))
+    }
+
+    fn remove_job(&mut self, job_id: usize) {
+        if let Some((pgid, _)) = self.jobs.remove(&job_id) {
+            if let Some((_, pids)) = self.pgid_to_pids.remove(&pgid) {
+                assert!(pids.is_empty()); // ジョブ削除時はプロセスグループは空のはず
+            }
+        }
+    }
+
+    // 空のプロセスグループならtrueを返す
+    fn is_group_empty(&self, pgid: Pid) -> bool {
+        self.pgid_to_pids.get(&pgid).unwrap().1.is_empty()
+    }
+
+    // プロセスグループのプロセスすべてが停止中ならtrueを返す
+    XXX
 }
 
 fn fork_exec(pgid: Pid, filename: &str, args: &[&str], input: Option<i32>, output: Option<i32>) -> Result<Pid, DynError> {
