@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::mem::replace;
+use std::path::PathBuf;
 use std::process::exit;
 use std::sync::mpsc::{channel, Receiver, Sender, sync_channel, SyncSender};
 use std::thread;
@@ -82,7 +83,7 @@ impl Shell {
         // 起動
         spawn_sig_handler(worker_tx.clone())?;
         // 起動
-        // Worker::new().spawn(worker_rx, shell_tx);
+        Worker::new().spawn(worker_rx, shell_tx);
 
         // 終了コード
         let exit_val;
@@ -180,7 +181,7 @@ struct Worker {
     jobs: BTreeMap<usize, (Pid, String)>,
 
     // プロセスグループIDから (ジョブID,プロセスID)へのマップ
-    pgid_to_pid: HashMap<Pid, (usize, HashSet<Pid>)>,
+    pgid_to_pids: HashMap<Pid, (usize, HashSet<Pid>)>,
 
     pid_to_info: HashMap<Pid, ProcInfo>,
     // プロセスIDから プロセスグループIDへのマップ
@@ -193,7 +194,7 @@ impl Worker {
             exit_val: 0,
             fg: None, // フォアグラウンドはシェル
             jobs: BTreeMap::new(),
-            pgid_to_pid: HashMap::new(),
+            pgid_to_pids: HashMap::new(),
             pid_to_info: HashMap::new(),
             // シェルのプロセスグループIDを取得
             // ファイルディスクリプタに関連付けられたフォアグラウンドのプロセスグループIDを取得する
@@ -243,24 +244,6 @@ impl Worker {
                }
            }
         });
-    }
-
-    // 組み込みコマンドの実行、実行したら true を返す
-    fn build_in_cmd(&mut self,
-                    cmd: &[(&str, Vec<&str>)],
-                    shell_tx: &SyncSender<ShellMsg>) -> bool {
-        if cmd.len() > 1 {
-            // 組み込みコマンドのパイプはサポートしない
-            return false;
-        }
-
-        match cmd[0].0 {
-            "exit" => self.run_exit(&cmd[0].1, shell_tx),
-            // "jobs" => self.run_jobs(shell_tx), // ジョブ一覧表示
-            "fg" => self.run_fg(&cmd[0].1, shell_tx),
-            // "cd" => self.run_cd(&cmd[0].1, shall_tx),
-            _ => false,
-        }
     }
 
     fn run_exit(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
@@ -380,7 +363,7 @@ impl Worker {
             pgid,
         };
         let mut pids = HashMap::new();
-        pids.insert(pgid, info.close());
+        pids.insert(pgid, info.clone());
 
         // 2つ目のプロセスを生成
         if cmd.len() == 2 {
@@ -405,6 +388,60 @@ impl Worker {
 
         true
     }
+
+    /// 組み込みコマンドの場合はtrueを返す
+    fn built_in_cmd(&mut self, cmd: &[(&str, Vec<&str>)], shell_tx: &SyncSender<ShellMsg>) -> bool {
+        if cmd.len() > 1 {
+            return false; // 組み込みコマンドのパイプは非対応なのでエラー
+        }
+
+        match cmd[0].0 {
+            "exit" => self.run_exit(&cmd[0].1, shell_tx),
+            "jobs" => self.run_jobs(shell_tx),
+            "fg" => self.run_fg(&cmd[0].1, shell_tx),
+            "cd" => self.run_cd(&cmd[0].1, shell_tx),
+            _ => false,
+        }
+    }
+
+    /// jobsコマンドを実行
+    fn run_jobs(&mut self, shell_tx: &SyncSender<ShellMsg>) -> bool {
+        for (job_id, (pgid, cmd)) in &self.jobs {
+            let state = if self.is_group_stop(*pgid).unwrap() {
+                "停止中"
+            } else {
+                "実行中"
+            };
+            println!("[{job_id}] {state}\t{cmd}")
+        }
+        self.exit_val = 0; // 成功
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap(); // シェルを再開
+        true
+    }
+
+    /// カレントディレクトリを変更。引数がない場合は、ホームディレクトリに移動。第2引数以降は無視
+    fn run_cd(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
+        let path = if args.len() == 1 {
+            // 引数が指定されていない場合、ホームディレクトリか/へ移動
+            dirs::home_dir()
+                .or_else(|| Some(PathBuf::from("/")))
+                .unwrap()
+        } else {
+            PathBuf::from(args[1])
+        };
+
+        // カレントディレクトリを変更
+        if let Err(e) = std::env::set_current_dir(&path) {
+            self.exit_val = 1; // 失敗
+            eprintln!("cdに失敗: {e}");
+        } else {
+            self.exit_val = 0; // 成功
+        }
+
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+        true
+    }
+
 
     // 子プロセスの状態管理
     fn wait_child(&mut self, shell_tx: &SyncSender<ShellMsg>) {
@@ -491,7 +528,7 @@ impl Worker {
         let line = &self.jobs.get(&job_id).unwrap().1;
         if is_fg {
             // 状態が変化したプロセスはフォアグラウンドに設定する
-            if self.is_group_empty(pgid).unwrap() {
+            if self.is_group_empty(pgid) {
                 // フォアグラウンドプロセスが空の場合、
                 // ジョブ情報を削除してシェルをフォアグラウンドに設定
                 eprintln!("[{job_id}]終了\t{line}");
@@ -505,7 +542,7 @@ impl Worker {
                 self.set_shell_fg(shell_tx);
             }
         } else {
-            if self.is_group_empty(pgid).unwrap() {
+            if self.is_group_empty(pgid) {
                 eprintln!("\n[{job_id}]終了\t{line}");
                 // プロセスグループが空の場合、ジョブ情報を削除
                 self.remove_job(job_id);
@@ -567,7 +604,31 @@ impl Worker {
     }
 
     // プロセスグループのプロセスすべてが停止中ならtrueを返す
-    XXX
+    fn is_group_stop(&self, pgid: Pid) -> Option<bool> {
+        for pid in self.pgid_to_pids.get(&pgid)?.1.iter() {
+            if self.pid_to_info.get(pid).unwrap().state == ProcState::Run {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    // シェルをフォアグラウンドに設定、シェルの入力を再開
+    fn set_shell_fg(&mut self, shell_tx: &SyncSender<ShellMsg>) {
+        self.fg = None;
+        tcsetpgrp(libc::STDIN_FILENO, self.shell_pgid).unwrap();
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+    }
+
+    // 新たなジョブIDを取得
+    fn get_new_job_id(&self) -> Option<usize> {
+        for i in 0..=usize::MAX {
+            if !self.jobs.contains_key(&i) {
+                return Some(i);
+            }
+        }
+        None
+    }
 }
 
 fn fork_exec(pgid: Pid, filename: &str, args: &[&str], input: Option<i32>, output: Option<i32>) -> Result<Pid, DynError> {
